@@ -16,6 +16,42 @@ use serde_json::Value;
 
 pub const MAX_PROVIDER_JSON_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 
+/// Cap on how much of a non-JSON error body may be replayed in the user-visible
+/// error text, and even then only when `GOOSE_ERROR_BODY_PREVIEW` opts in.
+///
+/// That string is rendered in the UI, written to session history, and replayed to
+/// the provider on every later turn. An uncapped gateway HTML page would therefore
+/// be unbounded cost plus a prompt-injection vector aimed at the very content
+/// filter that just rejected the request: a rejection whose text is echoed into
+/// history poisons the session on every subsequent request, not just the one that
+/// triggered it. Providers rarely put the useful part past a few hundred chars.
+const MAX_ERROR_BODY_PREVIEW_CHARS: usize = 600;
+
+/// Cap on how much is kept in the log. Logs are outside the model's context, so
+/// they carry no replay or injection cost and can be far more generous.
+const MAX_ERROR_BODY_LOG_CHARS: usize = 4_000;
+
+/// Truthiness for the preview switch, split from the env read so it is testable
+/// without mutating global process state.
+fn body_preview_enabled_from(raw: Option<&str>) -> bool {
+    let Some(raw) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
+        return false;
+    };
+    matches!(
+        raw.to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+/// Whether the raw provider error body should also reach the error text.
+///
+/// Off by default. The body is text controlled by the provider - or by a
+/// middlebox, or by whatever content-inspection layer answered on its behalf -
+/// and the log already records it for the operator who needs it.
+fn error_body_preview_enabled() -> bool {
+    body_preview_enabled_from(std::env::var("GOOSE_ERROR_BODY_PREVIEW").ok().as_deref())
+}
+
 /// Strip credentials and sensitive query parameters from a URL for safe
 /// inclusion in error messages and logs. Drops userinfo (`user:pass@`) and
 /// all query parameters (which may contain API keys like `?key=...`).
@@ -241,6 +277,79 @@ fn is_context_length_exceeded_message(text: &str) -> bool {
     text_lower.contains("many-image") && text_lower.contains("exceed")
 }
 
+/// Codes and phrases that mean the provider's **content filter** rejected the
+/// request, as opposed to the request being malformed, oversized, or the service
+/// being busy.
+///
+/// Worth separating out because this class of failure is permanent for a given
+/// conversation: the history is rebuilt identically on every turn, so a rejection
+/// of text that is already *in* that history fails the same way forever. Surfacing
+/// it as a generic "Bad request" invites an agent to retry a wall indefinitely.
+/// Matched lowercased against error codes/types as well as the message text,
+/// because gateways put the signal in the code (`DataInspectionFailed`) and leave
+/// the message as prose - or vice versa.
+const CONTENT_INSPECTION_MARKERS: &[&str] = &[
+    "datainspectionfailed",
+    "contentinspectionfailed",
+    "content_inspection_fail",
+    "inspection_failed",
+    "inspection failed",
+    "inappropriate content",
+    "content policy",
+    "content-policy",
+    "content filter",
+    "content-filter",
+    "moderation_blocked",
+    "content_filtered",
+    "moderation flag",
+    "responsible ai",
+    "safety system",
+    "content management policy",
+    "was filtered due to",
+    "usage policy",
+];
+
+/// Appended to a detected content rejection: the one fact the retrying agent
+/// cannot infer from the response, namely that retrying the identical request
+/// cannot succeed, and where the operator can find the raw provider body.
+const CONTENT_INSPECTION_GUIDANCE: &str = " [content-policy rejection: the provider rejected the content of this request, and the same history is rebuilt on every turn, so retrying will fail identically. Start a new session or drop the offending turn rather than retrying. The raw provider body is logged in the engine log (data/logs/cli/<date>/<run>.log); set GOOSE_ERROR_BODY_PREVIEW=1 to append it to this message.]";
+
+/// Lowercased string at an object path, if present and a string.
+fn lower_str_at(payload: &Value, path: &[&str]) -> Option<String> {
+    let mut node = payload;
+    for key in path {
+        node = node.get(*key)?;
+    }
+    node.as_str().map(|s| s.to_ascii_lowercase())
+}
+
+/// Which content-inspection marker explains this rejection, if any.
+///
+/// Only inspects the *structured* error fields plus the message Goose would
+/// already show: it never logs or returns the raw body here, so a hostile body
+/// cannot use these markers to get echoed into history.
+fn content_inspection_reason(payload: Option<&Value>, message: &str) -> Option<&'static str> {
+    let mut haystacks: Vec<String> = Vec::new();
+    if let Some(payload) = payload {
+        for path in [
+            ["error", "code"].as_slice(),
+            ["error", "type"].as_slice(),
+            ["error", "param"].as_slice(),
+            ["code"].as_slice(),
+            ["type"].as_slice(),
+        ] {
+            haystacks.extend(lower_str_at(payload, path));
+        }
+    }
+    haystacks.push(message.to_ascii_lowercase());
+    haystacks.iter().find_map(|haystack| {
+        CONTENT_INSPECTION_MARKERS
+            .iter()
+            .find(|marker| haystack.contains(*marker))
+            .copied()
+    })
+}
+
 pub fn map_http_error_to_provider_error(
     status: StatusCode,
     payload: Option<Value>,
@@ -290,6 +399,13 @@ pub fn map_http_error(
             let payload_str = extract_message();
             if is_context_length_exceeded(payload.as_ref(), &payload_str) {
                 ProviderError::ContextLengthExceeded(payload_str)
+            } else if let Some(marker) =
+                content_inspection_reason(payload.as_ref(), &payload_str)
+            {
+                ProviderError::Refusal {
+                    details: format!("{payload_str}{CONTENT_INSPECTION_GUIDANCE}"),
+                    category: Some(marker.to_string()),
+                }
             } else {
                 ProviderError::RequestFailed(format!("Bad request (400): {}", payload_str))
             }
@@ -324,6 +440,40 @@ pub fn map_http_error(
 
 #[derive(Clone, Copy)]
 pub struct ResponseDeadline(tokio::time::Instant);
+
+/// Trim a non-JSON error body down to something safe to embed in an error.
+///
+/// Collapses all whitespace so a multi-hundred-line HTML error page cannot forge
+/// separate log entries or stand out as injected instructions in chat history, and
+/// truncates on a char boundary - `&s[..n]` panics mid-string on the multibyte
+/// UTF-8 that gateways routinely return for localized messages.
+fn truncate_body_preview(body: &str, cap: usize) -> String {
+    let collapsed = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    let collapsed = collapsed.trim();
+    if collapsed.is_empty() {
+        return String::new();
+    }
+    let mut preview: String = collapsed.chars().take(cap).collect();
+    if collapsed.chars().count() > cap {
+        preview.push_str("[truncated]");
+    }
+    preview
+}
+
+/// Append a non-JSON error body to the error's own details, if it carries one.
+///
+/// Only variants with a `details` slot can hold it; everything else is left as the
+/// status mapping produced it rather than changing the error's shape.
+fn apply_body_preview(err: &mut ProviderError, body: &str) {
+    let preview = truncate_body_preview(body, MAX_ERROR_BODY_PREVIEW_CHARS);
+    if preview.is_empty() {
+        return;
+    }
+    if let Some(details) = err.details_mut() {
+        details.push_str(" body: ");
+        details.push_str(&preview);
+    }
+}
 
 pub fn set_response_deadline(response: &mut Response, deadline: tokio::time::Instant) {
     response.extensions_mut().insert(ResponseDeadline(deadline));
@@ -442,6 +592,36 @@ pub async fn handle_status(response: Response) -> Result<Response, ProviderError
     handle_status_with_limit(response, MAX_PROVIDER_JSON_RESPONSE_BYTES).await
 }
 
+/// Extract a JSON payload from an SSE-framed error body (`data: {json}`), when there is one.
+///
+/// Some OpenAI-compatible gateways answer a *failed* request with their normal streaming
+/// envelope rather than a bare JSON document. DashScope-compatible endpoints do this for
+/// content-policy rejections: status 400, `content-type: text/event-stream`, and a body of
+/// `data: {"error":{"code":"data_inspection_failed",...}}`. `serde_json::from_str` trips on the
+/// `data:` prefix, the provider's own explanation gets thrown away, and a permanent rejection
+/// surfaces as an empty, retryable `Bad request (400): `.
+pub(crate) fn recover_json_from_sse(text: &str) -> Option<Value> {
+    for line in text.lines() {
+        let Some(rest) = line.trim().strip_prefix("data:") else {
+            continue;
+        };
+        let candidate = rest.trim();
+        if !(candidate.starts_with('{') || candidate.starts_with('[')) {
+            continue;
+        }
+        if let Ok(value) = serde_json::from_str::<Value>(candidate) {
+            return Some(value);
+        }
+    }
+    // Frame spread over several lines: fall back to the outermost JSON object in the body.
+    let start = text.find('{')?;
+    let end = text.rfind('}')?;
+    if end <= start {
+        return None;
+    }
+    serde_json::from_str::<Value>(text[start..=end].trim()).ok()
+}
+
 async fn handle_status_with_limit(
     response: Response,
     limit: usize,
@@ -450,11 +630,30 @@ async fn handle_status_with_limit(
     if !status.is_success() {
         let url = sanitize_url(response.url().as_str());
         let headers = response.headers().clone();
-        let body = read_response_body_with_limit(response, limit)
-            .await
-            .unwrap_or_default();
-        let body = String::from_utf8_lossy(&body);
-        let payload = serde_json::from_str::<Value>(&body).ok();
+        // `unwrap_or_default()` used to make an oversized or unreadable body
+        // indistinguishable from one that was genuinely empty - both arrived as a
+        // 400 with no detail at all. Record which one it was.
+        let body_bytes = match read_response_body_with_limit(response, limit).await {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                tracing::warn!(
+                    "could not read provider error body from {url} (status {status}): {e}"
+                );
+                Vec::new()
+            }
+        };
+        let body = String::from_utf8_lossy(&body_bytes);
+        let payload = serde_json::from_str::<Value>(&body).ok().or_else(|| {
+            recover_json_from_sse(&body).map(|value| {
+                tracing::warn!(
+                    status = %status,
+                    url = %url,
+                    bytes = body_bytes.len(),
+                    "provider framed its error response as an SSE data: event; recovered the JSON payload"
+                );
+                value
+            })
+        });
         let request_id = extract_request_id(&headers);
         let mut err = map_http_error(status, payload.clone(), &url, request_id.as_deref());
         if let ProviderError::RateLimitExceeded { details, .. } = &err {
@@ -463,6 +662,31 @@ async fn handle_status_with_limit(
                 retry_delay: extract_retry_after(&headers, payload.as_ref()),
             };
         }
+        // `map_http_error` can only describe a body it could parse as JSON. Gateways,
+        // load balancers, and content-filter layers routinely answer with plain text or
+        // HTML, which until now collapsed to an empty detail - "Bad request (400): ." -
+        // leaving no way to distinguish a policy rejection from a malformed request.
+        if payload.is_none() {
+            // Always to the log: outside the model's context, so no replay cost.
+            // The headers say whether this really was the provider answering, or an
+            // interception layer answering for it with nothing.
+            let logged = truncate_body_preview(&body, MAX_ERROR_BODY_LOG_CHARS);
+            tracing::warn!(
+                status = %status,
+                url = %url,
+                bytes = body_bytes.len(),
+                request_id = ?request_id,
+                server = ?header_value(&headers, "server"),
+                content_length = ?header_value(&headers, "content-length"),
+                content_type = ?header_value(&headers, "content-type"),
+                raw_body = %logged,
+                "provider error body was not valid JSON"
+            );
+            if error_body_preview_enabled() {
+                apply_body_preview(&mut err, &body);
+            }
+        }
+
         return Err(err);
     }
     Ok(response)
@@ -487,6 +711,46 @@ mod tests {
     use serde_json::json;
     use std::io::Write;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn recovers_sse_framed_error_payload() {
+        let body = "data: {\"error\":{\"code\":\"data_inspection_failed\",\"message\":\"Input text data may contain inappropriate content.\"}}\n\n";
+        let value = recover_json_from_sse(body).expect("frame should yield a payload");
+        assert_eq!(value["error"]["code"], "data_inspection_failed");
+    }
+
+    #[test]
+    fn recovers_sse_frame_without_space_and_skips_event_lines() {
+        let body = "event: error\ndata:{\"error\":{\"code\":\"inspection_failed\"}}";
+        let value = recover_json_from_sse(body).expect("space-less frame should still parse");
+        assert_eq!(value["error"]["code"], "inspection_failed");
+    }
+
+    #[test]
+    fn recovers_frame_spread_over_several_lines() {
+        let body = "data: {\n  \"error\": {\"code\": \"data_inspection_failed\"}\n}\n";
+        let value = recover_json_from_sse(body).expect("multi-line fallback should recover it");
+        assert_eq!(value["error"]["code"], "data_inspection_failed");
+    }
+
+    #[test]
+    fn leaves_genuinely_unparsable_bodies_alone() {
+        // We must not invent a payload where the provider really gave none: an HTML proxy
+        // page, an empty body, and a bare stream terminator all stay unclassified, so the
+        // blank-detail 400 keeps its retry budget.
+        assert!(recover_json_from_sse("<html>502 Bad Gateway</html>").is_none());
+        assert!(recover_json_from_sse("").is_none());
+        assert!(recover_json_from_sse("data: [DONE]").is_none());
+    }
+
+    #[test]
+    fn framed_moderation_rejection_becomes_a_refusal_end_to_end() {
+        let body = "data: {\"error\":{\"code\":\"data_inspection_failed\",\"message\":\"Input text data may contain inappropriate content.\",\"type\":\"data_inspection_failed\"}}";
+        let payload = recover_json_from_sse(body).expect("the frame must be recovered");
+        let reason = content_inspection_reason(Some(&payload), "")
+            .expect("the recovered code must classify as a content-policy rejection");
+        assert!(!reason.is_empty());
+    }
     use tokio::net::TcpListener;
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -515,6 +779,130 @@ mod tests {
             .send()
             .await
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn non_json_error_body_stays_out_of_the_error_unless_opted_in() {
+        let raw = b"HTTP/1.1 400 Bad Request\r\nconnection: close\r\n\r\nDataInspectionFailed: input rejected by content policy".to_vec();
+        let response = response_from_raw(raw).await;
+
+        let err = handle_status_with_limit(response, 4096).await.unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.contains("Bad request (400):"),
+            "status mapping should be preserved, got: {text}"
+        );
+        assert!(
+            !text.contains("body:"),
+            "provider text must not reach replayed history by default, got: {text}"
+        );
+    }
+
+    #[test]
+    fn body_preview_switch_is_off_unless_given_a_truthy_value() {
+        assert!(!body_preview_enabled_from(None));
+        assert!(!body_preview_enabled_from(Some("")));
+        assert!(!body_preview_enabled_from(Some("  ")));
+        assert!(!body_preview_enabled_from(Some("0")));
+        assert!(body_preview_enabled_from(Some("1")));
+        assert!(body_preview_enabled_from(Some("TRUE")));
+        assert!(body_preview_enabled_from(Some(" yes ")));
+    }
+
+    #[test]
+    fn body_preview_is_collapsed_and_cut_on_a_char_boundary() {
+        // Whitespace from a HTML error page must not forge log lines or chat structure.
+        let html = "<html>\n  <body>  Blocked  \n</body>\n</html>";
+        let one_line = truncate_body_preview(html, 600);
+        assert_eq!(one_line, "<html> <body> Blocked </body> </html>");
+
+        // Multibyte UTF-8 is routine in localized gateway messages; `&s[..n]` panics.
+        let wide = "错误信息：请求被内容策略拒绝".repeat(40);
+        let cut = truncate_body_preview(&wide, 12);
+        assert!(cut.ends_with("[truncated]"), "got: {cut}");
+        assert_eq!(cut.chars().count(), 12 + "[truncated]".chars().count());
+        assert!(String::from_utf8(cut.into_bytes()).is_ok());
+
+        assert_eq!(truncate_body_preview("   \n\t ", 600), "");
+    }
+
+    #[test]
+    fn apply_body_preview_attaches_only_to_errors_with_a_details_slot() {
+        let mut err = ProviderError::RequestFailed("Bad request (400): ".to_string());
+        apply_body_preview(&mut err, "DataInspectionFailed: input rejected");
+        let text = err.to_string();
+        assert!(
+            text.contains("body: DataInspectionFailed: input rejected"),
+            "got {text}"
+        );
+
+        // An empty body must not fabricate a `body:` suffix.
+        let mut empty = ProviderError::RequestFailed("Bad request (400): ".to_string());
+        apply_body_preview(&mut empty, "   ");
+        assert!(!empty.to_string().contains("body:"), "got {empty}");
+
+        // Variants without a details slot keep their original shape.
+        let mut slotless = ProviderError::NotConfigured;
+        apply_body_preview(&mut slotless, "gateway said no");
+        assert!(!slotless.to_string().contains("body:"), "got {slotless}");
+
+        // Variants that do carry details all get annotated, not just RequestFailed.
+        let mut ctx = ProviderError::ContextLengthExceeded("too long".to_string());
+        apply_body_preview(&mut ctx, "max context is 65536");
+        assert!(
+            ctx.to_string().contains("body: max context is 65536"),
+            "got {ctx}"
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_error_body_is_still_an_error_and_stays_bounded() {
+        let filler = "line of html\n".repeat(200);
+        let raw = format!(
+            "HTTP/1.1 400 Bad Request\r\nconnection: close\r\n\r\n{}",
+            filler
+        )
+        .into_bytes();
+        let response = response_from_raw(raw).await;
+
+        let err = handle_status_with_limit(response, 4096).await.unwrap_err();
+        assert!(
+            err.to_string().contains("Bad request (400):"),
+            "oversized body must still map to a 400, got len={}",
+            err.to_string().len()
+        );
+
+        // The preview itself is what has to stay bounded and single-line.
+        let preview = truncate_body_preview(&filler, MAX_ERROR_BODY_PREVIEW_CHARS);
+        assert!(preview.contains("[truncated]"), "got len={}", preview.len());
+        assert!(
+            !preview.contains('\n'),
+            "collapsed preview must not embed newlines"
+        );
+        assert!(
+            preview.chars().count() <= MAX_ERROR_BODY_PREVIEW_CHARS + "[truncated]".chars().count(),
+            "preview should stay bounded, got {}",
+            preview.chars().count()
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_body_is_not_silently_read_as_empty() {
+        // A body larger than the read limit used to collapse to `unwrap_or_default()`,
+        // making "gateway returned 40MB of HTML" look identical to "gateway said nothing".
+        let raw = format!(
+            "HTTP/1.1 400 Bad Request\r\nconnection: close\r\ncontent-length: {}\r\n\r\n{}",
+            4096 + 1,
+            "x".repeat(4096 + 1)
+        )
+        .into_bytes();
+        let response = response_from_raw(raw).await;
+
+        let err = handle_status_with_limit(response, 4096).await.unwrap_err();
+        assert!(
+            err.to_string().contains("Bad request (400):"),
+            "over-limit body must still produce the mapped error, got: {err}"
+        );
     }
 
     #[tokio::test]
@@ -657,6 +1045,94 @@ mod tests {
             error.insert(key.to_string(), value);
         }
         json!({ "error": error })
+    }
+
+    /// A gateway content-inspection rejection: the signal is in `code`, the
+    /// message is prose, and neither is in the shape OpenAI uses.
+    #[test]
+    fn dashscope_style_content_inspection_400_becomes_a_refusal() {
+        let payload = json!({
+            "code": "DataInspectionFailed",
+            "message": "Input data may contain inappropriate content.",
+            "request_id": "req_abc456"
+        });
+        let err = map_http_error(
+            StatusCode::BAD_REQUEST,
+            Some(payload),
+            "https://gateway.invalid/compatible-mode/v1/chat/completions",
+            Some("req_abc456"),
+        );
+        match &err {
+            ProviderError::Refusal { details, category } => {
+                assert_eq!(category.as_deref(), Some("datainspectionfailed"));
+                assert!(
+                    details.contains("content-policy rejection"),
+                    "guidance missing: {details}"
+                );
+                assert!(
+                    details.contains("req_abc456"),
+                    "request id must survive: {details}"
+                );
+            }
+            other => panic!("expected a refusal, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn openai_style_filtered_400_becomes_a_refusal() {
+        let payload = json!({
+            "error": {
+                "message": "The response was filtered due to the prompt triggering our policy.",
+                "type": "invalid_request_error"
+            }
+        });
+        let err = map_http_error(StatusCode::BAD_REQUEST, Some(payload), "u", None);
+        assert!(
+            matches!(&err, ProviderError::Refusal { category: Some(_), .. }),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn ordinary_bad_request_is_still_a_request_failure() {
+        let payload = error_payload([("type", json!("invalid_request_error"))]);
+        let err = map_http_error(StatusCode::BAD_REQUEST, Some(payload), "u", None);
+        assert!(
+            matches!(&err, ProviderError::RequestFailed(m) if m.contains("Bad request (400)")),
+            "got: {err:?}"
+        );
+    }
+
+    /// The blank-body fault: `Payload: None` with an empty message. Nothing here is
+    /// classifiable, so it must keep its old retryable shape - some blank 400s do
+    /// clear on retry, and stealing that would be a regression.
+    #[test]
+    fn blank_detail_400_stays_a_retryable_request_failure() {
+        let err = map_http_error(StatusCode::BAD_REQUEST, None, "u", None);
+        assert!(
+            matches!(&err, ProviderError::RequestFailed(m) if m.contains("Bad request (400)")),
+            "got: {err:?}"
+        );
+        assert!(content_inspection_reason(None, "").is_none());
+    }
+
+    #[test]
+    fn classifier_reads_the_message_when_there_is_no_json_payload() {
+        assert!(content_inspection_reason(
+            None,
+            "Input data may contain inappropriate content. (provider request id: abc)"
+        )
+        .is_some());
+        assert!(content_inspection_reason(
+            Some(&json!({ "error": { "code": "data_inspection_failed", "message": "x" } })),
+            "x"
+        )
+        .is_some());
+        assert!(content_inspection_reason(
+            Some(&json!({ "error": { "code": "rate_limit_exceeded" } })),
+            "slow down"
+        )
+        .is_none());
     }
 
     #[tokio::test]
