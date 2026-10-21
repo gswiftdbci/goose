@@ -1,4 +1,5 @@
 use crate::base::ThinkingPreservationFormat;
+use crate::content_policy::content_policy_refusal;
 use crate::conversation::message::{Message, MessageContentBlock, ProviderMetadata};
 use crate::conversation::token_usage::{CostSource, ProviderUsage, Usage};
 use crate::documents::{
@@ -1199,6 +1200,9 @@ fn classify_choiceless_frame(value: &Value) -> Option<ProviderError> {
             Some(s) => format!("Gateway returned status {s} mid-stream"),
             None => "Unknown server error".to_string(),
         });
+    if let Some(refusal) = content_policy_refusal(Some(value), &details) {
+        return Some(refusal);
+    }
     Some(ProviderError::ServerError(details))
 }
 
@@ -1227,6 +1231,12 @@ fn parse_streaming_chunk(line: &str) -> Result<Option<StreamingChunk>, ProviderE
             .get("message")
             .and_then(|m| m.as_str())
             .unwrap_or("Unknown server error");
+        // A content-policy rejection delivered as an error frame inside an HTTP 200 is
+        // still permanent for the conversation: it must not come back as a retryable
+        // ServerError, or the agent replays the rejected history until retries run out.
+        if let Some(refusal) = content_policy_refusal(Some(&value), message) {
+            return Err(refusal);
+        }
         return Err(ProviderError::ServerError(message.to_string()));
     }
 
@@ -1235,6 +1245,9 @@ fn parse_streaming_chunk(line: &str) -> Result<Option<StreamingChunk>, ProviderE
             .get("message")
             .and_then(|m| m.as_str())
             .unwrap_or("Unknown server error");
+        if let Some(refusal) = content_policy_refusal(Some(&value), message) {
+            return Err(refusal);
+        }
         return Err(ProviderError::ServerError(message.to_string()));
     }
 
@@ -5212,6 +5225,32 @@ data: [DONE]"#;
                     "message preserved for {line}, got {msg:?}"
                 ),
                 other => panic!("expected ServerError for {line}, got {other:?}"),
+            }
+        }
+    }
+
+    /// The same content rejection can arrive as an error frame inside an HTTP 200 rather
+    /// than as a 400 status. It is still permanent for the conversation, so it must not
+    /// come back as a retryable ServerError and eat the retry budget replaying the very
+    /// text the filter rejected.
+    #[test]
+    fn test_in_stream_content_policy_frame_is_a_refusal() {
+        for line in [
+            r#"{"error":{"code":"data_inspection_failed","message":"Input data may contain inappropriate content."}}"#,
+            r#"{"statusCode":400,"code":"DataInspectionFailed","message":"Input data may contain inappropriate content."}"#,
+            r#"{"type":"error","message":"Your prompt was filtered due to our content policy."}"#,
+        ] {
+            match parse_streaming_chunk(line) {
+                Err(ProviderError::Refusal {
+                    details, category, ..
+                }) => {
+                    assert!(category.is_some(), "category lost for {line}");
+                    assert!(
+                        details.contains("content-policy rejection"),
+                        "guidance lost for {line}, got {details:?}"
+                    );
+                }
+                other => panic!("expected Refusal for {line}, got {other:?}"),
             }
         }
     }
