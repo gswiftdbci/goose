@@ -181,6 +181,18 @@ function translateMenuLabels(items: MenuItem[]): void {
 }
 
 // Settings management
+// Portable-bundle support: when GOOSE_USER_DATA_DIR is set (the bundle launcher
+// writes it as a per-user environment variable), Electron's userData moves into
+// the bundle so the desktop profile travels with the portable install. Bare
+// launches (a goose:// deep link starts Goose.exe with no --user-data-dir)
+// inherit the same user env var, so both routes resolve to the same profile
+// directory and the single-instance lock still forwards instead of forking a
+// rival instance. Must run before any app.getPath('userData') call below.
+const portableUserDataDir = process.env.GOOSE_USER_DATA_DIR;
+if (portableUserDataDir && portableUserDataDir.trim()) {
+  app.setPath('userData', portableUserDataDir.trim());
+}
+
 const SETTINGS_FILE = path.join(app.getPath('userData'), 'settings.json');
 const STARTUP_LOGS_DIR = path.join(app.getPath('userData'), 'logs', 'startup');
 const validLanguageSettings = new Set<Settings['language']>([
