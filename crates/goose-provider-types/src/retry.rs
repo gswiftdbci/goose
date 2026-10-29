@@ -294,6 +294,19 @@ mod tests {
     }
 
     #[test]
+    fn never_retries_content_policy_refusal() {
+        let config = RetryConfig::default();
+        let error = ProviderError::Refusal {
+            details: "Input data may contain inappropriate content. [content-policy rejection: \
+                      the same history is rebuilt every turn, so retrying will fail identically]"
+                .into(),
+            category: Some("datainspectionfailed".into()),
+        };
+        assert!(!should_retry(&error, &config));
+        assert_eq!(error.telemetry_type(), "refusal");
+    }
+
+    #[test]
     fn permanent_request_failure_marker_detection() {
         assert!(is_permanent_request_failure(
             "messages.3.content.1: `thinking` blocks in the latest assistant message \

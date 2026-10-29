@@ -21,6 +21,7 @@ These are the minimum required variables to get started with goose.
 | `GOOSE_TEMPERATURE` | Sets the [temperature](https://medium.com/@kelseyywang/a-comprehensive-guide-to-llm-temperature-%EF%B8%8F-363a40bbc91f) for model responses | Float between 0.0 and 1.0 | Model-specific default |
 | `GOOSE_MAX_TOKENS` | Sets the maximum number of tokens for each model response (truncates longer responses) | Positive integer (e.g., 4096, 8192) | Model-specific default |
 | `GOOSE_CACHE_TTL` | Sets the Anthropic prompt-cache TTL. `1h` keeps the cached prefix alive across idle gaps (e.g. stepping away mid-session) but bills cache writes at 2x input instead of 1.25x, so it only pays off for sessions that actually idle. Headless runs (`goose run`, subagents, scheduled recipes) always use `5m` | `5m`, `1h` | `5m` |
+| `GOOSE_ERROR_BODY_PREVIEW` | Appends the raw provider error body to an error message when the gateway answers with something that is not JSON. Off by default: that text is controlled by the provider (or by whatever middlebox answered for it) and it lands in session history, which is rebuilt and resent on every later turn. The bounded body is always written to the engine log regardless | `1`, `true`, `yes`, `on` | off |
 
 **Examples**
 

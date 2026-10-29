@@ -1,6 +1,7 @@
 pub mod base;
 pub mod cache_semantics;
 pub mod canonical;
+pub mod content_policy;
 pub mod context_limit;
 pub mod conversation;
 pub mod documents;
