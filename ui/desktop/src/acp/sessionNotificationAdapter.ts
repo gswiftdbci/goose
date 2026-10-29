@@ -33,6 +33,7 @@ export interface AcpSessionNotificationAdapter {
   applyElicitationRequest(request: AcpElicitationRequest): AcpChatStateChange[];
   applyElicitationStatus(elicitationId: string, status: ElicitationStatus): AcpChatStateChange[];
   getMessages(): Message[];
+  getStreamedSteerMessageIds(): Set<string>;
 }
 
 export function createAcpSessionNotificationAdapter(
@@ -66,6 +67,9 @@ export function createAcpSessionNotificationAdapter(
     },
     getMessages() {
       return state.messages.map(cloneMessage);
+    },
+    getStreamedSteerMessageIds() {
+      return new Set(state.localSteerTextByMessageId.keys());
     },
   };
 }
