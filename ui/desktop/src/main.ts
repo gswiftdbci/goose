@@ -60,6 +60,7 @@ import installExtension, { REACT_DEVELOPER_TOOLS } from 'electron-devtools-insta
 import { openExternalUrl } from './utils/openExternalUrl';
 import { buildCSP, leaseBackendOrigin, shouldApplyRendererCsp } from './utils/csp';
 import { resolveWorkingDir } from './utils/workingDir';
+import { resolveUserDataDir } from './utils/userDataDir';
 import {
   DesktopFileAccess,
   isAuthorizedFileAccessRequest,
@@ -181,6 +182,19 @@ function translateMenuLabels(items: MenuItem[]): void {
 }
 
 // Settings management
+// Portable-bundle support: an explicit --user-data-dir switch wins, because it
+// is a per-invocation choice (several Goose windows on one box, each with its
+// own profile) while GOOSE_USER_DATA_DIR is per-user and would otherwise
+// redirect every launch on the machine into one directory. Bare launches, such
+// as a goose:// deep link that starts Goose.exe with no --user-data-dir, fall
+// back to GOOSE_USER_DATA_DIR, so both routes resolve to the same profile
+// directory and the single-instance lock still forwards instead of forking a
+// rival instance. Must run before any app.getPath('userData') call below.
+const userDataDir = resolveUserDataDir();
+if (userDataDir) {
+  app.setPath('userData', userDataDir);
+}
+
 const SETTINGS_FILE = path.join(app.getPath('userData'), 'settings.json');
 const STARTUP_LOGS_DIR = path.join(app.getPath('userData'), 'logs', 'startup');
 const validLanguageSettings = new Set<Settings['language']>([
