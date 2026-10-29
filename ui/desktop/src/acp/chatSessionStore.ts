@@ -739,18 +739,25 @@ function discardPendingLocalSteerMessages(entry: StoreEntry): void {
 function createAdapterForEntry(entry: StoreEntry): AcpSessionNotificationAdapter {
   return createAcpSessionNotificationAdapter(
     entry.messages,
-    confirmedLocalSteerTextByMessageId(entry)
+    // #12748: only carry over steer text the previous adapter actually received
+    // server chunks for. Seeding a confirmed-but-never-streamed steer's local
+    // text makes the pickup chunk append on top of it, doubling the bubble.
+    confirmedLocalSteerTextByMessageId(entry, entry.adapter.getStreamedSteerMessageIds())
   );
 }
 
-function confirmedLocalSteerTextByMessageId(entry: StoreEntry): Map<string, string> {
+function confirmedLocalSteerTextByMessageId(
+  entry: StoreEntry,
+  streamedSteerMessageIds: Set<string>
+): Map<string, string> {
   const textByMessageId = new Map<string, string>();
 
   for (const message of entry.messages) {
     if (
       !message.id ||
       !message.metadata.steer ||
-      entry.pendingLocalSteerMessageIds.has(message.id)
+      entry.pendingLocalSteerMessageIds.has(message.id) ||
+      !streamedSteerMessageIds.has(message.id)
     ) {
       continue;
     }
