@@ -86,6 +86,34 @@ Keep `-subj` single-slashed when invoking openssl from cmd/PowerShell.
 - `local/all-fixes` and `fix/content-inspection-error-classification` are
   both pushed (force-with-lease).
 
+
+## dibputer goosed service (added 2026-11-08, post-reply)
+
+goosed on dibputer is now a boot-time scheduled task, independent of the
+desktop app, running the **fork binary**:
+
+- Wrapper: `C:\Users\nepha\GooseRemote\goosed-service.cmd`
+  - reads the secret from `dibputer.secret` into `GOOSE_SERVER__SECRET_KEY`
+    (double underscore — the real var name, confirmed in
+    `crates/goose-cli/src/cli.rs`)
+  - runs `C:\Users\nepha\GooseRemote\bin\goose.exe` (built from
+    `local/all-fixes`, v1.58.0) with
+    `serve --platform desktop --enable-scheduler --host 0.0.0.0 --port 3284 --tls`
+  - logs to `C:\Users\nepha\GooseRemote\goosed.log`
+- Task: `GooseServe` (schtasks, /sc onstart, runs as nepha, 30s boot delay).
+  Created elevated; "Interactive only" logon mode is expected for a
+  user-account task.
+- Live-verified: task instance binds 3284, /status ok, secret probe 406, WS
+  101 through the webui proxy.
+
+**Spawn-race caveat (learned live):** the desktop app auto-respawns its own
+`goose serve` if its leased instance dies while the app is open (and it uses
+`--allow-lan`, the task does not — behavior matches at boot since the task
+owns 3284 before any login). On a clean boot the task's instance owns 3284
+first and the desktop connects to it as the external backend. If you ever see
+two `goose.exe serve` processes at once, that's the desktop respawn — check
+`netstat -ano | findstr 3284` and kill the one whose parent is Goose.exe.
+
 ## Action item for the swiftserver side (small)
 
 The frontend bundle on swiftserver predates the identity feature:
