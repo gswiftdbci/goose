@@ -36,6 +36,7 @@ export const bootstrapWeb = async () => {
     if (typeof webConfig.GOOSE_WEBUI_ID === 'string') {
       setWebuiAgentId(webConfig.GOOSE_WEBUI_ID);
       console.info(`[goose webui] agent: ${webConfig.GOOSE_WEBUI_ID}`);
+      document.title = `goose@${webConfig.GOOSE_WEBUI_ID}`;
     }
   }
 };
