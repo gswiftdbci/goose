@@ -9,6 +9,7 @@ import ChatSessionsContainer from '../ChatSessionsContainer';
 import { useChatContext } from '../../contexts/ChatContext';
 import { NavigationProvider, useNavigationContext } from './NavigationContext';
 import { Navigation } from './NavigationPanel';
+import { WebuiAgentBadge } from './WebuiAgentBadge';
 import { Z_INDEX } from './constants';
 import { cn } from '../../utils';
 import { UserInput } from '../../types/message';
@@ -137,6 +138,7 @@ const AppLayoutContent: React.FC<AppLayoutContentProps> = ({ activeSessions, liv
         >
           <PanelLeft className="w-5 h-5" />
         </Button>
+        <WebuiAgentBadge />
       </div>
 
       {/* Main content with navigation. Shared white canvas; the sidebar is a
