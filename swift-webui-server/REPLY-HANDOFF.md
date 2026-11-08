@@ -122,7 +122,7 @@ The frontend bundle on swiftserver predates the identity feature:
    Build it from the **`local/all-fixes` branch** so it includes all fixes.
 2. Make the swiftserver front door include `GOOSE_WEBUI_ID: "swiftserver"`
    in its `/goose/config` response (and start it with the env var).
-3. Verify: Settings version shows `· swiftserver`; console shows the agent line.
+3. Verify: browser tab reads `goose@swiftserver`, a `goose@swiftserver` badge shows in the header (top-left, next to the sidebar toggle), Settings version shows `· swiftserver`, console shows the agent line. All three come from GOOSE_WEBUI_ID alone.
 
 Until step 1 lands, swiftserver keeps working fully — it just lacks the
 identity label.
