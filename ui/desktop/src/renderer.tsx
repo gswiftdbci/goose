@@ -6,6 +6,7 @@ import { ErrorBoundary } from './components/ErrorBoundary';
 import SuspenseLoader from './suspense-loader';
 import { applyThemeTokens } from './theme/theme-tokens';
 import { currentLocale, currentMessageLocale, loadMessages } from './i18n';
+import { bootstrapWeb } from './web/bootstrap';
 
 // Apply theme tokens to :root before first paint.
 applyThemeTokens();
@@ -27,6 +28,7 @@ function handleIntlError(err: { code: string; message?: string }) {
 }
 
 (async () => {
+  await bootstrapWeb();
   const messages = await loadMessages(currentMessageLocale);
 
   ReactDOM.createRoot(document.getElementById('root')!).render(

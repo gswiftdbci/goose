@@ -125,6 +125,13 @@ module.exports = [
         MediaTrackConstraints: 'readonly',
         Blob: 'readonly',
         FormData: 'readonly',
+        location: 'readonly',
+        matchMedia: 'readonly',
+        Notification: 'readonly',
+        EventListener: 'readonly',
+        addEventListener: 'readonly',
+        removeEventListener: 'readonly',
+        Window: 'readonly',
       },
     },
     plugins: {
