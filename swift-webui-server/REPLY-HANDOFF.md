@@ -106,7 +106,7 @@ desktop app, running the **fork binary**:
 - Live-verified: task instance binds 3284, /status ok, secret probe 406, WS
   101 through the webui proxy.
 
-**Spawn-race caveat (learned live):** the desktop app auto-respawns its own
+**Operational rule (learned the hard way, twice):** the dibputer goose *agent session* (this document was written by it) is served by goosed on 3284. Killing/restarting goosed from inside a session cuts the session off mid-task. Never restart goosed from within an active session — let the scheduled task own restarts at boot. **Spawn-race caveat (learned live):** the desktop app auto-respawns its own
 `goose serve` if its leased instance dies while the app is open (and it uses
 `--allow-lan`, the task does not — behavior matches at boot since the task
 owns 3284 before any login). On a clean boot the task's instance owns 3284
