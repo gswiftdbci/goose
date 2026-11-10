@@ -1,5 +1,5 @@
 import React, { useRef, useState, useEffect, useMemo, useCallback } from 'react';
-import { ArrowUp, Bug } from 'lucide-react';
+import { ArrowUp, Bug, RefreshCw } from 'lucide-react';
 import { Tooltip, TooltipContent, TooltipTrigger } from './ui/Tooltip';
 import { Button } from './ui/button';
 import type { View } from '../utils/navigationUtils';
@@ -1841,7 +1841,29 @@ export default function ChatInput({
           </Tooltip>
         )}
 
-        {/* Right: send / stop — soft gray circle with up-arrow */}
+        {/* Right: send / stop — refresh sits directly above it */}
+        <div className="flex flex-col items-center gap-1">
+          {sessionId && (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  type="button"
+                  size="sm"
+                  shape="round"
+                  variant="ghost"
+                  aria-label="Refresh chat log"
+                  title="Refresh chat log"
+                  onClick={() => window.electron?.reloadApp?.()}
+                  className="bg-background-tertiary text-text-primary hover:bg-background-tertiary/70"
+                >
+                  <RefreshCw className="w-4 h-4" strokeWidth={2.25} />
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent>
+                <p>Refresh chat log — reloads and resumes this session</p>
+              </TooltipContent>
+            </Tooltip>
+          )}
         {isLoading && !hasSubmittableContent ? (
           <Button
             type="button"
@@ -1882,6 +1904,7 @@ export default function ChatInput({
             </TooltipContent>
           </Tooltip>
         )}
+        </div>
         {sessionId && diagnosticsOpen && (
           <DiagnosticsModal
             isOpen={diagnosticsOpen}
