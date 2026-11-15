@@ -38,7 +38,7 @@ fn test_authenticated_acp_router(dir: &tempfile::TempDir) -> Router {
         session_cwd: None,
         enable_scheduler: false,
     }));
-    create_router(server, SECRET.to_string(), true, Vec::new())
+    create_router(server, SECRET.to_string(), true, Vec::new(), false)
 }
 
 fn test_router_with_origins(
@@ -59,6 +59,7 @@ fn test_router_with_origins(
         SECRET.to_string(),
         require_token,
         additional_allowed_origins,
+        false,
     )
 }
 

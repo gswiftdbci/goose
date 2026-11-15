@@ -56,6 +56,12 @@ impl AcpOriginPolicy {
         Self::loopback_and(Self::file_origins(Vec::new()))
     }
 
+    /// Like local_default, but additionally trusts explicit origins (e.g. the
+    /// LAN address when serving with --allow-lan).
+    fn local_default_with(origins: Vec<HeaderValue>) -> Self {
+        Self::loopback_and(Self::file_origins(origins))
+    }
+
     fn file_origins(mut origins: Vec<HeaderValue>) -> Vec<HeaderValue> {
         origins.extend([
             HeaderValue::from_static(OPAQUE_ORIGIN),
@@ -210,6 +216,25 @@ fn create_acp_router_with_policy(
     acp_routes.layer(acp_cors_layer(policy))
 }
 
+/// Best-effort discovery of this machine's non-loopback IPv4 addresses.
+pub fn local_lan_ips() -> Vec<std::net::IpAddr> {
+    let mut ips = Vec::new();
+    if let Ok(socket) = std::net::UdpSocket::bind(std::net::SocketAddr::from(([0, 0, 0, 0], 0))) {
+        if socket
+            .connect(std::net::SocketAddr::from(([192, 0, 2, 1], 9)))
+            .is_ok()
+        {
+            if let Ok(addr) = socket.local_addr() {
+                let ip = addr.ip();
+                if !ip.is_loopback() {
+                    ips.push(ip);
+                }
+            }
+        }
+    }
+    ips
+}
+
 /// The bare ACP HTTP/WebSocket router (POST/GET/DELETE on `/acp`), without auth
 /// or goose-specific auxiliary routes.
 pub fn create_acp_router(server: Arc<AcpServer>) -> Router {
@@ -227,8 +252,11 @@ pub fn create_router(
     secret_key: String,
     require_token: bool,
     additional_allowed_origins: Vec<HeaderValue>,
+    allow_lan: bool,
 ) -> Router {
-    let policy = if !additional_allowed_origins.is_empty() {
+    let policy = if allow_lan {
+        AcpOriginPolicy::local_default_with(additional_allowed_origins)
+    } else if !additional_allowed_origins.is_empty() {
         AcpOriginPolicy::exact(additional_allowed_origins)
     } else if require_token {
         AcpOriginPolicy::local_default()
@@ -245,4 +273,20 @@ pub fn create_router(
         .layer(aux_cors_layer());
 
     acp_routes.merge(aux_routes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn local_default_with_allows_lan_loopback_and_file_origins() {
+        let lan: HeaderValue = "https://192.168.42.50:3284".parse().unwrap();
+        let policy = AcpOriginPolicy::local_default_with(vec![lan]);
+        assert!(policy.origin_allowed(&"https://192.168.42.50:3284".parse().unwrap()));
+        assert!(policy.origin_allowed(&"http://localhost:3000".parse().unwrap()));
+        assert!(policy.origin_allowed(&"http://127.0.0.1:3000".parse().unwrap()));
+        assert!(policy.origin_allowed(&HeaderValue::from_static("null")));
+        assert!(policy.origin_allowed(&HeaderValue::from_static("file://")));
+        assert!(!policy.origin_allowed(&"https://evil.example.com".parse().unwrap()));
+    }
 }

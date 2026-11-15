@@ -1083,7 +1083,7 @@ fn enrich_model_ids_with_canonical(
     let mut seen_keys: HashSet<String> = HashSet::new();
 
     for id in model_ids {
-        let model = enriched_model(provider_family, id, None);
+        let model = enriched_model(provider_family, id, None, None);
         let dedup_key = if is_databricks_v2_model_service(provider_family, id) {
             id
         } else {
@@ -1109,7 +1109,7 @@ fn enrich_model_ids_with_canonical(
             if !id.starts_with("goose-") {
                 continue;
             }
-            let candidate = enriched_model(provider_family, id, None);
+            let candidate = enriched_model(provider_family, id, None, None);
             if let Some(&idx) = name_to_idx.get(&candidate.name) {
                 if !models[idx].id.starts_with("goose-") {
                     models[idx].id = candidate.id;
@@ -1140,7 +1140,12 @@ fn configured_models_to_inventory(
     let mut result: Vec<InventoryModel> = Vec::new();
     let mut seen_names: HashSet<String> = HashSet::new();
     for model in models {
-        let enriched = enriched_model(provider_family, &model.name, model.context_limit);
+        let enriched = enriched_model(
+            provider_family,
+            &model.name,
+            model.context_limit,
+            Some(model.reasoning),
+        );
         if seen_names.insert(enriched.name.clone()) {
             result.push(enriched);
         }
@@ -1182,6 +1187,7 @@ fn enriched_model(
     provider_family: &str,
     model_id: &str,
     fallback_context_limit: Option<usize>,
+    fallback_reasoning: Option<bool>,
 ) -> InventoryModel {
     // The registry guard is dropped inside the closure: the fallback below takes its own
     // read lock, and a nested read can block behind a queued catalog refresh.
@@ -1209,7 +1215,10 @@ fn enriched_model(
             .as_ref()
             .map(|model| model.limit.context)
             .or(fallback_context_limit),
-        reasoning: metadata.as_ref().and_then(|model| model.reasoning),
+        reasoning: metadata
+            .as_ref()
+            .and_then(|model| model.reasoning)
+            .or(fallback_reasoning),
         recommended: false,
     }
 }
@@ -1289,6 +1298,20 @@ mod tests {
             assert_eq!(variant.context_limit, models[0].context_limit);
             assert_eq!(variant.reasoning, models[0].reasoning);
         }
+    }
+
+    #[test]
+    fn configured_reasoning_flag_used_when_canonical_entry_missing() {
+        let mut reasoning_model = ModelInfo::new("qwen4-max-preview").with_context_limit(1_000_000);
+        reasoning_model.reasoning = true;
+        let plain_model = ModelInfo::new("qwen4-plain");
+        let models = configured_models_to_inventory(
+            "custom-qwen-cloud-token-plan-2",
+            &[reasoning_model, plain_model],
+        );
+        assert_eq!(models[0].reasoning, Some(true));
+        assert_eq!(models[0].context_limit, Some(1_000_000));
+        assert_eq!(models[1].reasoning, Some(false));
     }
 
     #[test]

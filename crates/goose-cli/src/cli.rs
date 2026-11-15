@@ -880,6 +880,12 @@ enum Command {
         #[arg(long, default_value = "3284")]
         port: u16,
 
+        #[arg(
+            long,
+            help = "Bind to all interfaces and allow browser access from the machine's LAN address"
+        )]
+        allow_lan: bool,
+
         #[arg(long, help = "Serve ACP over TLS")]
         tls: bool,
 
@@ -1558,6 +1564,7 @@ struct ServeCommandArgs {
     host: String,
 
     port: u16,
+    allow_lan: bool,
     tls: bool,
     tls_cert_path: Option<String>,
     tls_key_path: Option<String>,
@@ -1701,8 +1708,9 @@ async fn handle_serve_command(args: ServeCommandArgs) -> Result<()> {
     use tracing::{info, warn};
 
     let ServeCommandArgs {
-        host,
+        mut host,
         port,
+        allow_lan,
         tls,
         tls_cert_path,
         tls_key_path,
@@ -1752,7 +1760,7 @@ async fn handle_serve_command(args: ServeCommandArgs) -> Result<()> {
             "{GOOSE_SERVER_SECRET_KEY_ENV} is not set and --dangerously-unauthenticated was passed; the ACP endpoint will accept unauthenticated connections"
         );
     }
-    let additional_allowed_origins = allowed_origins
+    let mut additional_allowed_origins = allowed_origins
         .into_iter()
         .map(|origin| {
             let origin = origin.trim();
@@ -1764,6 +1772,26 @@ async fn handle_serve_command(args: ServeCommandArgs) -> Result<()> {
             })
         })
         .collect::<Result<Vec<_>>>()?;
+    if allow_lan {
+        if host == "127.0.0.1" {
+            host = "0.0.0.0".to_string();
+        }
+        for ip in goose::acp::transport::local_lan_ips() {
+            for scheme in ["http", "https"] {
+                additional_allowed_origins
+                    .push(HeaderValue::from_str(&format!("{scheme}://{ip}:{port}"))?);
+            }
+        }
+        info!(
+            "LAN access enabled: allowing origins {}",
+            additional_allowed_origins
+                .iter()
+                .filter(|o| !o.is_empty())
+                .map(|o| o.to_str().unwrap_or_default())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
     let secret_key = env_secret.unwrap_or_else(generate_serve_secret_key);
     if let Err(error) = server.start_scheduler().await {
         warn!("Scheduler failed to start; scheduled jobs will not run until a client connects: {error}");
@@ -1779,6 +1807,7 @@ async fn handle_serve_command(args: ServeCommandArgs) -> Result<()> {
         secret_key,
         require_token,
         additional_allowed_origins,
+        allow_lan,
     );
 
     let config = Config::global();
@@ -2842,6 +2871,7 @@ pub async fn cli() -> anyhow::Result<()> {
         Some(Command::Serve {
             host,
             port,
+            allow_lan,
             tls,
             tls_cert_path,
             tls_key_path,
@@ -2856,6 +2886,7 @@ pub async fn cli() -> anyhow::Result<()> {
             handle_serve_command(ServeCommandArgs {
                 host,
                 port,
+                allow_lan,
                 tls,
                 tls_cert_path,
                 tls_key_path,
