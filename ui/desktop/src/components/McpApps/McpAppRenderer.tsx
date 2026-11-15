@@ -33,7 +33,7 @@ import type { CallToolResult, JSONRPCRequest, Tool } from '@modelcontextprotocol
 import { Maximize2, PictureInPicture2, X } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
 import { callMcpAppTool, readMcpAppResource } from '../../acp/mcp-apps';
-import { httpBaseFromAcpWebSocketUrl, isLoopbackAcpWebSocketUrl } from '../../acp/url';
+import { httpBaseFromAcpWebSocketUrl } from '../../acp/url';
 import { getCachedTools } from './toolsCache';
 import { AppEvents } from '../../constants/events';
 import { useTheme } from '../../contexts/ThemeContext';
@@ -100,43 +100,40 @@ const DEFAULT_IFRAME_HEIGHT = 200;
 const FULLSCREEN_HEADER_HEIGHT = 48;
 const DEFAULT_SANDBOX_PERMISSIONS = 'allow-scripts allow-same-origin allow-forms';
 
-async function fetchMcpAppProxyUrl(csp: McpUiResourceCsp | null): Promise<string | null> {
-  try {
-    const acpUrl = await window.electron.getAcpUrl();
-    const secretKey = await window.electron.getSecretKey();
+async function fetchMcpAppProxyUrl(csp: McpUiResourceCsp | null): Promise<string> {
+  const acpUrl = await window.electron.getAcpUrl();
+  const secretKey = await window.electron.getSecretKey();
 
-    if (!acpUrl || !secretKey) {
-      console.error('[McpAppRenderer] Failed to get ACP URL or secret key');
-      return null;
-    }
-
-    if (!isLoopbackAcpWebSocketUrl(acpUrl)) {
-      console.error('[McpAppRenderer] MCP app proxy is only supported for loopback ACP backends');
-      return null;
-    }
-
-    const httpBase = httpBaseFromAcpWebSocketUrl(acpUrl).replace(/\/+$/, '');
-    const proxyUrl = new URL(`${httpBase}/mcp-app-proxy`);
-    proxyUrl.searchParams.set('secret', secretKey);
-
-    if (csp?.connectDomains?.length) {
-      proxyUrl.searchParams.set('connect_domains', csp.connectDomains.join(','));
-    }
-    if (csp?.resourceDomains?.length) {
-      proxyUrl.searchParams.set('resource_domains', csp.resourceDomains.join(','));
-    }
-    if (csp?.frameDomains?.length) {
-      proxyUrl.searchParams.set('frame_domains', csp.frameDomains.join(','));
-    }
-    if (csp?.baseUriDomains?.length) {
-      proxyUrl.searchParams.set('base_uri_domains', csp.baseUriDomains.join(','));
-    }
-
-    return proxyUrl.toString();
-  } catch (error) {
-    console.error('[McpAppRenderer] Error fetching MCP App Proxy URL:', error);
-    return null;
+  if (!acpUrl || !secretKey) {
+    throw new Error('Failed to get ACP URL or secret key');
   }
+
+  const httpBase = httpBaseFromAcpWebSocketUrl(acpUrl).replace(/\/+$/, '');
+  const proxyUrl = new URL(`${httpBase}/mcp-app-proxy`);
+  proxyUrl.searchParams.set('secret', secretKey);
+
+  if (csp?.connectDomains?.length) {
+    proxyUrl.searchParams.set('connect_domains', csp.connectDomains.join(','));
+  }
+  if (csp?.resourceDomains?.length) {
+    proxyUrl.searchParams.set('resource_domains', csp.resourceDomains.join(','));
+  }
+  if (csp?.frameDomains?.length) {
+    proxyUrl.searchParams.set('frame_domains', csp.frameDomains.join(','));
+  }
+  if (csp?.baseUriDomains?.length) {
+    proxyUrl.searchParams.set('base_uri_domains', csp.baseUriDomains.join(','));
+  }
+
+  // Preflight so server-side policy errors (e.g. a loopback-only backend)
+  // surface as the sandbox failure message instead of an iframe timeout.
+  const response = await fetch(proxyUrl.toString());
+  if (!response.ok) {
+    const detail = (await response.text()).trim();
+    throw new Error(detail || `MCP app proxy returned HTTP ${response.status}`);
+  }
+
+  return proxyUrl.toString();
 }
 
 interface McpAppRendererProps {
@@ -719,14 +716,22 @@ export default function McpAppRenderer({
       return;
     }
 
-    fetchMcpAppProxyUrl(pendingCsp).then((url) => {
-      if (url) {
+    fetchMcpAppProxyUrl(pendingCsp).then(
+      (url) => {
         sandboxUrlRef.current = { url, csp: pendingCsp };
         dispatch({ type: 'SANDBOX_READY', sandboxUrl: url, sandboxCsp: pendingCsp });
-      } else {
-        dispatch({ type: 'SANDBOX_FAILED', message: intl.formatMessage(i18n.failedToInitSandbox) });
+      },
+      (error: unknown) => {
+        console.error('[McpAppRenderer] Error fetching MCP App Proxy URL:', error);
+        dispatch({
+          type: 'SANDBOX_FAILED',
+          message:
+            error instanceof Error && error.message
+              ? error.message
+              : intl.formatMessage(i18n.failedToInitSandbox),
+        });
       }
-    });
+    );
   }, [state.status, pendingCsp, intl]);
 
   const handleOpenLink = useCallback(

@@ -15,26 +15,6 @@ export function httpBaseFromAcpWebSocketUrl(acpUrl: string): string {
   return `${url.origin}${pathPrefix}`;
 }
 
-export function isLoopbackAcpWebSocketUrl(acpUrl: string): boolean {
-  const url = new URL(acpUrl);
-
-  if (url.protocol !== 'ws:' && url.protocol !== 'wss:') {
-    throw new Error(`ACP URL must use ws: or wss:, got ${url.protocol}`);
-  }
-
-  const hostname = url.hostname.toLowerCase().replace(/^\[(.*)\]$/, '$1');
-  return hostname === 'localhost' || hostname === '::1' || isIpv4LoopbackLiteral(hostname);
-}
-
-function isIpv4LoopbackLiteral(hostname: string): boolean {
-  const octets = hostname.split('.');
-  if (octets.length !== 4 || octets.some((octet) => !/^\d+$/.test(octet))) {
-    return false;
-  }
-
-  return octets.every((octet) => Number(octet) <= 255) && Number(octets[0]) === 127;
-}
-
 export function normalizeAcpHttpBaseUrl(rawBaseUrl: string): string {
   const trimmed = rawBaseUrl.trim();
   if (!trimmed) {

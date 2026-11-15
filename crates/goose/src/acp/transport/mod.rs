@@ -247,6 +247,8 @@ async fn health() -> &'static str {
 
 /// The full standalone ACP server router used by `goose serve`: ACP transport,
 /// optional token auth, health/status endpoints, and the MCP app proxy.
+/// With `allow_lan`, the MCP app proxy and guest routes also accept
+/// non-loopback peers; they remain secret-gated.
 pub fn create_router(
     server: Arc<AcpServer>,
     secret_key: String,
@@ -269,7 +271,7 @@ pub fn create_router(
     let aux_routes = Router::new()
         .route("/health", get(health))
         .route("/status", get(health))
-        .merge(super::mcp_app_proxy::routes(secret_key))
+        .merge(super::mcp_app_proxy::routes(secret_key, allow_lan))
         .layer(aux_cors_layer());
 
     acp_routes.merge(aux_routes)

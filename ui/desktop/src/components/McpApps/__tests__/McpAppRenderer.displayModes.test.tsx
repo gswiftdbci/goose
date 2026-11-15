@@ -38,6 +38,7 @@ describe('McpAppRenderer display modes', () => {
   beforeEach(() => {
     electron.getAcpUrl = vi.fn(async () => 'ws://127.0.0.1:3000/acp');
     electron.getSecretKey = vi.fn(async () => 'secret');
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('<html></html>')));
     window.matchMedia = vi
       .fn()
       .mockReturnValue({ matches: false }) as unknown as typeof window.matchMedia;
@@ -51,6 +52,7 @@ describe('McpAppRenderer display modes', () => {
   afterEach(() => {
     delete electron.getAcpUrl;
     delete electron.getSecretKey;
+    vi.unstubAllGlobals();
   });
 
   function renderApp(displayMode: GooseDisplayMode) {

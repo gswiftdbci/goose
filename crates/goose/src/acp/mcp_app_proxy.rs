@@ -62,11 +62,7 @@ struct AppState {
     secret_key: String,
     guest_store: GuestHtmlStore,
     guest_base_url: String,
-}
-
-#[derive(Clone)]
-struct GuestState {
-    guest_store: GuestHtmlStore,
+    allow_remote: bool,
 }
 
 fn normalize_csp_source(source: &str) -> Option<String> {
@@ -230,7 +226,7 @@ async fn mcp_app_proxy(
     if params.secret != state.secret_key {
         return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
     }
-    if !peer_addr_is_loopback(&peer_addr) {
+    if !state.allow_remote && !peer_addr_is_loopback(&peer_addr) {
         return (
             StatusCode::BAD_REQUEST,
             "MCP app proxy is only available to loopback clients",
@@ -271,7 +267,7 @@ async fn store_guest_html(
     if body.secret != state.secret_key {
         return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
     }
-    if !peer_addr_is_loopback(&peer_addr) {
+    if !state.allow_remote && !peer_addr_is_loopback(&peer_addr) {
         return (
             StatusCode::BAD_REQUEST,
             "MCP app guest storage is only available to loopback clients",
@@ -316,7 +312,7 @@ async fn store_guest_html(
 }
 
 async fn serve_guest_html(
-    State(state): State<GuestState>,
+    State(state): State<AppState>,
     Query(params): Query<GuestQuery>,
 ) -> Response {
     let entry = {
@@ -348,7 +344,7 @@ async fn serve_guest_html(
     }
 }
 
-fn spawn_guest_server(guest_store: GuestHtmlStore) -> String {
+fn spawn_guest_server(state: AppState) -> String {
     let listener =
         std::net::TcpListener::bind(("127.0.0.1", 0)).expect("failed to bind MCP app guest server");
     let addr = listener
@@ -362,7 +358,7 @@ fn spawn_guest_server(guest_store: GuestHtmlStore) -> String {
 
     let app = Router::new()
         .route("/mcp-app-guest", get(serve_guest_html))
-        .with_state(GuestState { guest_store });
+        .with_state(state);
 
     tokio::spawn(async move {
         if let Err(error) = axum::serve(listener, app).await {
@@ -373,22 +369,28 @@ fn spawn_guest_server(guest_store: GuestHtmlStore) -> String {
     format!("http://{addr}")
 }
 
-pub(crate) fn routes(secret_key: String) -> Router {
-    let guest_store = Arc::new(RwLock::new(HashMap::new()));
-    let guest_base_url = spawn_guest_server(guest_store.clone());
-    let state = AppState {
+pub(crate) fn routes(secret_key: String, allow_remote: bool) -> Router {
+    let mut state = AppState {
         secret_key,
-        guest_store,
-        guest_base_url,
+        guest_store: Arc::new(RwLock::new(HashMap::new())),
+        guest_base_url: String::new(),
+        allow_remote,
     };
+    state.guest_base_url = spawn_guest_server(state.clone());
 
-    Router::new()
+    let mut router = Router::new()
         .route("/mcp-app-proxy", get(mcp_app_proxy))
         .route(
             "/mcp-app-guest",
             post(store_guest_html).layer(DefaultBodyLimit::max(GUEST_HTML_MAX_BYTES)),
-        )
-        .with_state(state)
+        );
+    if allow_remote {
+        // Remote clients cannot reach the loopback guest server; the sandbox
+        // proxy template serves guest HTML from this origin instead, with an
+        // opaque-origin sandbox so guests stay isolated from the proxy secret.
+        router = router.route("/mcp-app-guest", get(serve_guest_html));
+    }
+    router.with_state(state)
 }
 
 #[cfg(test)]
@@ -477,7 +479,7 @@ mod tests {
 
     #[tokio::test]
     async fn stores_guest_html_larger_than_default_body_limit() {
-        let app = super::routes("test-secret".to_string());
+        let app = super::routes("test-secret".to_string(), false);
         let large_html = "x".repeat(3 * 1024 * 1024);
         let body = serde_json::json!({
             "secret": "test-secret",
@@ -498,5 +500,144 @@ mod tests {
         let response = app.oneshot(request).await.unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    fn request_with_peer(method: &str, uri: &str, body: Body, peer: &str) -> Request<Body> {
+        let mut request = Request::builder()
+            .method(method)
+            .uri(uri)
+            .body(body)
+            .unwrap();
+        request
+            .extensions_mut()
+            .insert(ConnectInfo(peer.parse::<SocketAddr>().unwrap()));
+        request
+    }
+
+    fn json_request_with_peer(uri: &str, body: String, peer: &str) -> Request<Body> {
+        let mut request = request_with_peer("POST", uri, Body::from(body), peer);
+        request
+            .headers_mut()
+            .insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
+        request
+    }
+
+    #[tokio::test]
+    async fn remote_peers_are_rejected_by_default() {
+        let app = super::routes("test-secret".to_string(), false);
+
+        let response = app
+            .clone()
+            .oneshot(request_with_peer(
+                "GET",
+                "/mcp-app-proxy?secret=test-secret",
+                Body::empty(),
+                "192.168.1.10:12345",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let body =
+            serde_json::json!({ "secret": "test-secret", "html": "<html></html>" }).to_string();
+        let response = app
+            .oneshot(json_request_with_peer(
+                "/mcp-app-guest",
+                body,
+                "192.168.1.10:12345",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn allow_remote_accepts_remote_peers_and_serves_guest_html() {
+        let app = super::routes("test-secret".to_string(), true);
+
+        let response = app
+            .clone()
+            .oneshot(request_with_peer(
+                "GET",
+                "/mcp-app-proxy?secret=test-secret",
+                Body::empty(),
+                "192.168.1.10:12345",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = serde_json::json!({ "secret": "test-secret", "html": "<html>guest</html>" })
+            .to_string();
+        let response = app
+            .clone()
+            .oneshot(json_request_with_peer(
+                "/mcp-app-guest",
+                body,
+                "192.168.1.10:12345",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let stored: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let nonce = stored["nonce"].as_str().unwrap();
+
+        let response = app
+            .oneshot(request_with_peer(
+                "GET",
+                &format!("/mcp-app-guest?nonce={nonce}"),
+                Body::empty(),
+                "192.168.1.10:12345",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn allow_remote_still_requires_the_secret() {
+        let app = super::routes("test-secret".to_string(), true);
+
+        let response = app
+            .clone()
+            .oneshot(request_with_peer(
+                "GET",
+                "/mcp-app-proxy?secret=wrong",
+                Body::empty(),
+                "192.168.1.10:12345",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let body = serde_json::json!({ "secret": "wrong", "html": "<html></html>" }).to_string();
+        let response = app
+            .oneshot(json_request_with_peer(
+                "/mcp-app-guest",
+                body,
+                "192.168.1.10:12345",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn guest_get_route_is_absent_without_allow_remote() {
+        let app = super::routes("test-secret".to_string(), false);
+
+        let response = app
+            .oneshot(request_with_peer(
+                "GET",
+                "/mcp-app-guest?nonce=whatever",
+                Body::empty(),
+                "127.0.0.1:12345",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
     }
 }
