@@ -24,7 +24,11 @@ if (-not $SkipEngine) {
     $binDir = Join-Path $Root 'ui\desktop\src\bin'
     New-Item -ItemType Directory -Path $binDir -Force | Out-Null
     $dst = Join-Path $binDir 'goose.exe'
-    if (Test-Path $dst) { Rename-Item $dst 'goose.exe.old' -Force }
+    if (Test-Path $dst) {
+        $oldBin = Join-Path $binDir 'goose.exe.old'
+        if (Test-Path $oldBin) { Remove-Item $oldBin -Force }
+        Rename-Item $dst 'goose.exe.old' -Force
+    }
     Copy-Item (Join-Path $Root 'target\release\goose.exe') $dst
     Write-Host '  engine staged into ui/desktop/src/bin' -ForegroundColor Green
 }
