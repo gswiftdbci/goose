@@ -75,7 +75,14 @@ const requestHandler = (req, res) => {
     res.end(JSON.stringify({ acpUrl: `${wsScheme}://${req.headers.host}/acp?token=${SECRET}` }));
     return;
   }
-  if (url.pathname === '/status' || url.pathname.startsWith('/acp')) {
+  // MCP app sandbox routes: the renderer preflights /mcp-app-proxy and the
+  // proxy iframe stores/fetches guest HTML on /mcp-app-guest (same origin).
+  if (
+    url.pathname === '/status' ||
+    url.pathname.startsWith('/acp') ||
+    url.pathname === '/mcp-app-proxy' ||
+    url.pathname.startsWith('/mcp-app-guest')
+  ) {
     proxyToGoosed(req, res);
     return;
   }
@@ -86,6 +93,13 @@ const requestHandler = (req, res) => {
     return;
   }
   res.setHeader('content-type', MIME[path.extname(file)] ?? 'application/octet-stream');
+  if (url.pathname === '/' || url.pathname.endsWith('index.html')) {
+    res.setHeader('cache-control', 'no-cache');
+  } else if (url.pathname.startsWith('/assets/')) {
+    res.setHeader('cache-control', 'public, max-age=31536000, immutable');
+  } else {
+    res.setHeader('cache-control', 'no-cache');
+  }
   fs.createReadStream(file).pipe(res);
 };
 

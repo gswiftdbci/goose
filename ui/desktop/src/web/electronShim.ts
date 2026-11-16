@@ -67,7 +67,16 @@ const overrides: Record<string, unknown> = {
   arch: 'x64',
 
   getAcpUrl: async () => acpUrl,
-  getSecretKey: async () => null,
+  // The hosted webui receives the secret as the ACP URL's token parameter
+  // (web-test-server /goose/acp-url); MCP app sandbox routes need it too.
+  getSecretKey: async () => {
+    if (!acpUrl) return null;
+    try {
+      return new URL(acpUrl).searchParams.get('token');
+    } catch {
+      return null;
+    }
+  },
 
   getSetting: async <K extends SettingKey>(key: K): Promise<Settings[K]> =>
     readSetting(key) ?? defaultSettings[key],
