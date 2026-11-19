@@ -2,6 +2,7 @@
 _2026-11-08, from the dibputer-side session (author of `goose-webui-HANDOFF.md`)_
 _Responds to `goose-webui-HANDOFF-UPDATE-2026-11-08.md`. Read that first, then this._
 _**Amended later on 2026-11-08** (see "Git state" section) after branch cleanup + a rebase onto fresh upstream._
+_**Amended 2026-11-18** (see "2026-11-18 update" section): 1.60.0 rebase + swiftserver serve/gateway deployed; dibputer service still 1.59.2 pending a safe restart._
 
 ## TL;DR for whoever maintains either deployment
 
@@ -146,3 +147,111 @@ identity label.
 Where they conflict on "what is deployed", the later document wins; where
 they conflict on "how the contracts behave", verify against
 `ui/desktop/scripts/web-test-server.js` — it remains canonical.
+
+## 2026-11-18 update: 1.60.0 rebase + swiftserver serve/gateway deployment
+
+_Session: dibputer-side goose agent. Supersedes the version/deployment facts
+above; the contracts in the original HANDOFF are unchanged._
+
+### Git state (current authority)
+
+- `local/all-fixes` rebased onto upstream/main `6e2a515e6` (1.60.0 era) and
+  force-pushed to origin. Tip: `9f05b1d8f` (dist rebuild commit).
+- Of the 72 pre-rebase commits: 53 were exact upstream duplicates (dropped),
+  4 were release/dep-bump artifacts (dropped — replaying them would downgrade
+  versions), 15 were genuine fork patches (replayed cleanly except one file).
+- Only conflict: `crates/goose/src/acp/templates/mcp_app_proxy.html` —
+  resolved as a hybrid (next section).
+- Backups: `backup/local-all-fixes-20261118` (dibputer),
+  `backup/pre-160-233b2b6c7` (swiftserver checkout).
+- The swiftserver-local OnceLock fix (`233b2b6c7`) is no longer needed:
+  upstream's `goose-mcp/src/subprocess.rs` already imports OnceLock.
+
+### MCP proxy template: the hybrid decision
+
+Upstream #13608 hardened the proxy (loopback-only guest origin, strict
+URL/nonce validation, origin-scoped postMessage). That model breaks the
+fork's `--allow-lan` remote guests: the loopback guest server is unreachable
+off-machine. Resolution:
+
+- **Loopback path: identical to upstream** — full `buildGuestTarget`
+  validation, origin-scoped messaging, race guards.
+- **Remote path: fork design + equivalent protections** — guest served from
+  the main origin under an opaque-origin sandbox (`allow-scripts allow-forms`,
+  no `allow-same-origin`), UUID-nonce shape validation, incoming messages
+  gated by `event.source === guestIframe.contentWindow` (origin checks are
+  impossible for opaque origins — they all report "null"). Outgoing
+  postMessage uses `'*'` only in remote mode.
+- Residual risk (accepted): host→guest messages on LAN cannot be
+  origin-scoped; a malicious guest that self-navigates its iframe could
+  receive subsequent host messages. Limited in practice: the guest IS the
+  MCP app (messages are meant for it), the sandbox blocks top-navigation,
+  and the nonce is single-use.
+- Divergence from upstream is +36/−5 lines in this one file. Server-side
+  LAN gating (secret + allow_lan peer checks) is unchanged.
+- Verified live from dibputer as a remote peer: proxy GET 200 serving the
+  remote-mode template, wrong secret 401, guest POST nonce + GET content ok.
+
+### Version semantics
+
+- Engine reports **1.60.0** — that is upstream main's version. The `v1.60.1`
+  tag lives on `release/1.60.1`; its single fix (compaction `<analysis>`
+  scratchpad drop, #13572) is also on main and therefore in this build.
+- Toolchain pinned to **1.99.0** (`rust-toolchain.toml`); MSRV 1.95.0.
+
+### swiftserver deployment (this session)
+
+- `goose-server` and `goose-gateway` both run
+  `local/goose-server:1.60.0-9f05b1d8f`. Compose updated (goose-dist, image
+  tag, GOOSE_CHANNEL for both services); backup `.bak-*-pre-160`.
+- Transport: **incremental** bundle `all-fixes-1.60.0.bundle` (6.4 MB;
+  prerequisite `72b8db883`, already on host) → `~/goose-server/home/local/`.
+  Checkout origin now points at it — use the **host path**
+  `/home/dib/goose-server/home/local/...`, not the container path.
+- Build ran inside goose-server against `/home/goose/git/goose-all-fixes`
+  (316 crates, exit 0). **New native deps required build tools in the
+  container**: `build-essential`, `cmake`, `pkg-config`, `libclang-dev`
+  (bindgen for llama-cpp-sys-2), `libcurl4-openssl-dev`. These live in the
+  container's writable layer — reinstall after any recreate, before the
+  next build. The runtime image does not need them.
+- **Stale-binary gotcha (hit once)**: `target/x86_64-unknown-linux-gnu/release/goose`
+  held the Nov-15 1.59.1 binary; the fresh build lands in `target/release/goose`.
+  The first deploy staged the stale one (containers reported 1.59.1);
+  re-staged the correct binary and redeployed. `swift-deploy-160.sh` now
+  prefers `target/release`. Always version-check the staged binary.
+- Webui front door (`/home/goose/webui/webui-server.js`, backup
+  `.bak-20261118`): added MCP-app routes (`/mcp-app-proxy`, `/mcp-app-guest`)
+  and cache headers (`no-cache` for html, `immutable` for `/assets/`),
+  matching the reference. Refresh-injection, crash diagnostics,
+  required-secret startup, and GOOSE_WEBUI_ID all preserved.
+- Fresh dist deployed (previous kept at `dist.pre-160`): includes identity
+  badge, MCP app support, nl locale. The 2026-11-08 "recopy dist" action
+  item is **done**.
+- Post-recreate, the webui needed a manual `run-webui.sh start` again
+  (autostart item still open).
+- Compose mirror synced to fleet-records (`8c5f0bf`). **Pre-existing fault**:
+  the fleet-records post-receive hook
+  `fleet/tools/refresh-records-export.sh` is missing on the server, so the
+  derived export refresh fails; the repo remains authoritative.
+
+### dibputer local state
+
+- all-locals build green on the rebased tree (engine release 4m33s, desktop
+  packaged, webui dist). Artifacts: `target/release/goose.exe` (1.60.0),
+  `ui/desktop/out/Goose-win32-x64/`, `ui/desktop/dist/` (committed `9f05b1d8f`).
+- **The boot-time goosed service still runs 1.59.2**
+  (`GooseRemote\bin\goose.exe`) — deliberately not restarted from inside a
+  live session. To adopt 1.60.0: stage the new binary into `GooseRemote\bin`
+  and let the scheduled task pick it up at next boot (or restart the task
+  in a maintenance window). The packaged desktop carries 1.60.0; deploying
+  it via `update-goose-locals.ps1` restarts the stack — do that outside
+  live sessions.
+
+### Open items (updated)
+
+1. swiftserver autostart after container recreate (compose post_start hook;
+   needs Dib's sudo) — still the highest-value next change.
+2. fleet-records export hook missing (pre-existing; see above).
+3. dibputer goosed service binary upgrade to 1.60.0 at a safe time.
+4. Trust model unchanged: any LAN browser that loads either front door gets
+   a token. Revisit before wider exposure.
