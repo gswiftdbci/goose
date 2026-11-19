@@ -2,7 +2,7 @@
 _2026-11-08, from the dibputer-side session (author of `goose-webui-HANDOFF.md`)_
 _Responds to `goose-webui-HANDOFF-UPDATE-2026-11-08.md`. Read that first, then this._
 _**Amended later on 2026-11-08** (see "Git state" section) after branch cleanup + a rebase onto fresh upstream._
-_**Amended 2026-11-18** (see "2026-11-18 update" section): 1.60.0 rebase + swiftserver serve/gateway deployed; dibputer service still 1.59.2 pending a safe restart._
+_**Amended 2026-11-18** (see "2026-11-18 update" section): 1.60.0 rebase + swiftserver serve/gateway deployed; dibputer local stack updated to 1.60.0 the same evening._
 
 ## TL;DR for whoever maintains either deployment
 
@@ -239,19 +239,17 @@ off-machine. Resolution:
 - all-locals build green on the rebased tree (engine release 4m33s, desktop
   packaged, webui dist). Artifacts: `target/release/goose.exe` (1.60.0),
   `ui/desktop/out/Goose-win32-x64/`, `ui/desktop/dist/` (committed `9f05b1d8f`).
-- **The boot-time goosed service still runs 1.59.2**
-  (`GooseRemote\bin\goose.exe`) — deliberately not restarted from inside a
-  live session. To adopt 1.60.0: stage the new binary into `GooseRemote\bin`
-  and let the scheduled task pick it up at next boot (or restart the task
-  in a maintenance window). The packaged desktop carries 1.60.0; deploying
-  it via `update-goose-locals.ps1` restarts the stack — do that outside
-  live sessions.
+- **Local stack updated to 1.60.0 the same evening (by Dib, outside the
+  agent session)**: `GooseRemote\bin\goose.exe` replaced with the 20:43
+  build and the goosed service restarted (verified: the running process
+  serves from that path, /status ok); desktop redeployed to
+  `GooseRemote\desktop-fork\dist-windows\` (Goose.exe from the 20:45
+  package, bundled `resources\bin\goose.exe` from the 20:43 engine build).
 
 ### Open items (updated)
 
 1. swiftserver autostart after container recreate (compose post_start hook;
    needs Dib's sudo) — still the highest-value next change.
 2. fleet-records export hook missing (pre-existing; see above).
-3. dibputer goosed service binary upgrade to 1.60.0 at a safe time.
-4. Trust model unchanged: any LAN browser that loads either front door gets
+3. Trust model unchanged: any LAN browser that loads either front door gets
    a token. Revisit before wider exposure.
